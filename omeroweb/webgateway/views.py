@@ -2896,6 +2896,85 @@ def _bulk_file_annotations(request, objtype, objid, conn=None, **kwargs):
 annotations = login_required()(jsonp(_bulk_file_annotations))
 
 
+def perform_table_query(conn, fileid, query, col_names, offset=0, limit=None, lazy=False):
+    ctx = conn.createServiceOptsDict()
+    ctx.setOmeroGroup("-1")
+
+    r = conn.getSharedResources()
+    t = r.openTable(omero.model.OriginalFileI(fileid), ctx)
+    if not t:
+        return dict(error="Table %s not found" % fileid)
+
+    try:
+        cols = t.getHeaders()
+        rows = t.getNumberOfRows()
+
+        range_start = offset
+        range_size = limit if limit is not None else rows
+        range_end = min(rows, range_start + range_size)
+
+        if query == "*":
+            hits = range(range_start, range_end)
+            totalCount = rows
+        else:
+            match = re.match(r"^(\w+)-(\d+)", query)
+            if match:
+                query = "(%s==%s)" % (match.group(1), match.group(2))
+            try:
+                logger.info(query)
+                hits = t.getWhereList(query, None, 0, rows, 1)
+                totalCount = len(hits)
+                # paginate the hits
+                hits = hits[range_start:range_end]
+            except Exception:
+                return dict(error="Error executing query: %s" % query)
+
+        logger.info("Retrieving {} rows".format(len(hits)))
+        def row_generator(table, h):
+            # hits are all consecutive rows - can load them in batches
+            idx = 0
+            batch = 1000
+            col_indices = range(len(cols))
+            if col_names:
+                col_indices = [i for (i, j) in enumerate(cols) if j.name in col_names]
+            while idx < len(h):
+                batch = min(batch, len(h) - idx)
+                res = table.slice(col_indices, h[idx : idx + batch])
+                idx += batch
+                # yield a list of rows
+                yield [[col.values[row] for col in res.columns] for row in range(0,len(res.rowNumbers))]
+            logger.info(time.perf_counter() - start)
+
+        row_gen = row_generator(t, hits)
+
+        rsp_data = {
+            "data": {
+                "column_types": [col.__class__.__name__ for col in cols],
+                "columns": [col.name for col in cols],
+            },
+            "meta": {
+                "rowCount": len(hits),
+                "totalCount": totalCount,
+                "limit": limit,
+                "offset": offset,
+            },
+        }
+
+        if not lazy:
+            row_data = []
+            # Use the generator to add all rows in batches
+            for rows in list(row_gen):
+                row_data.extend(rows)
+            rsp_data["data"]["rows"] = row_data
+        else:
+            rsp_data["data"]["lazy_rows"] = row_gen
+            rsp_data["table"] = t
+
+        return rsp_data
+    finally:
+        if not lazy:
+            t.close()
+
 def _table_query(request, fileid, conn=None, query=None, lazy=False, **kwargs):
     """
     Query a table specified by fileid
@@ -2927,95 +3006,14 @@ def _table_query(request, fileid, conn=None, query=None, lazy=False, **kwargs):
     if not query:
         return dict(error="Must specify query parameter, use * to retrieve all")
     col_names = request.GET.getlist("col_names")
+    offset = kwargs.get("offset", 0)
+    limit = kwargs.get("limit", None)
+    if not offset:
+        offset = int(request.GET.get("offset", 0))
+    if not limit:
+        limit = int(request.GET.get("limit")) if request.GET.get("limit") is not None else None
 
-    ctx = conn.createServiceOptsDict()
-    ctx.setOmeroGroup("-1")
-
-    r = conn.getSharedResources()
-    t = r.openTable(omero.model.OriginalFileI(fileid), ctx)
-    if not t:
-        return dict(error="Table %s not found" % fileid)
-
-    try:
-        cols = t.getHeaders()
-        rows = t.getNumberOfRows()
-
-        offset = kwargs.get("offset", 0)
-        limit = kwargs.get("limit", None)
-        if not offset:
-            offset = int(request.GET.get("offset", 0))
-        if not limit:
-            limit = (
-                int(request.GET.get("limit"))
-                if request.GET.get("limit") is not None
-                else None
-            )
-        range_start = offset
-        range_size = kwargs.get("limit", rows)
-        range_end = min(rows, range_start + range_size)
-
-        if query == "*":
-            hits = range(range_start, range_end)
-            totalCount = rows
-        else:
-            match = re.match(r"^(\w+)-(\d+)", query)
-            if match:
-                query = "(%s==%s)" % (match.group(1), match.group(2))
-            try:
-                logger.info(query)
-                hits = t.getWhereList(query, None, 0, rows, 1)
-                totalCount = len(hits)
-                # paginate the hits
-                hits = hits[range_start:range_end]
-            except Exception:
-                return dict(error="Error executing query: %s" % query)
-
-        def row_generator(table, h):
-            # hits are all consecutive rows - can load them in batches
-            idx = 0
-            batch = 1000
-            col_indices = range(len(cols))
-            if col_names:
-                col_indices = [i for (i, j) in enumerate(cols) if j.name in col_names]
-            while idx < len(h):
-                batch = min(batch, len(h) - idx)
-                res = table.slice(col_indices, h[idx : idx + batch])
-                idx += batch
-                # yield a list of rows
-                yield [
-                    [col.values[row] for col in res.columns]
-                    for row in range(0, len(res.rowNumbers))
-                ]
-
-        row_gen = row_generator(t, hits)
-
-        rsp_data = {
-            "data": {
-                "column_types": [col.__class__.__name__ for col in cols],
-                "columns": [col.name for col in cols],
-            },
-            "meta": {
-                "rowCount": len(hits),
-                "totalCount": totalCount,
-                "limit": limit,
-                "offset": offset,
-            },
-        }
-
-        if not lazy:
-            row_data = []
-            # Use the generator to add all rows in batches
-            for rows in list(row_gen):
-                row_data.extend(rows)
-            rsp_data["data"]["rows"] = row_data
-        else:
-            rsp_data["data"]["lazy_rows"] = row_gen
-            rsp_data["table"] = t
-
-        return rsp_data
-    finally:
-        if not lazy:
-            t.close()
+    return perform_table_query(conn, fileid, query, col_names, offset=offset, limit=limit, lazy=False)
 
 
 table_query = login_required()(jsonp(_table_query))
@@ -3052,6 +3050,43 @@ def _table_metadata(request, fileid, conn=None, query=None, lazy=False, **kwargs
 
 
 table_metadata = login_required()(jsonp(_table_metadata))
+
+
+def _obj_id_bitmask(request, fileid, conn=None, query=None, lazy=False, **kwargs):
+    col_name = request.GET.get("col_name", "object")
+    if query is None:
+        query = request.GET.get("query")
+    if not query:
+        return dict(error="Must specify query parameter, use * to retrieve all")
+    offset = kwargs.get("offset", 0)
+    limit = kwargs.get("limit", None)
+    if not offset:
+        offset = int(request.GET.get("offset", 0))
+    if not limit:
+        limit = int(request.GET.get("limit")) if request.GET.get("limit") is not None else None
+
+    rsp_data = perform_table_query(conn, fileid, query, [col_name], offset=offset, limit=limit, lazy=False)
+    logger.info(rsp_data)
+    bitmask = bytearray()
+    index = 0
+    value = 0
+    data = bytearray()
+    for obj in rsp_data['data']['rows']:
+        obj_id = obj[0]
+        while index < obj_id:
+            index += 1
+            if index % 8 == 0:
+                data.append(value)
+                value = 0
+                counter = 0
+        # index == obj_id
+        value += 2 ** (index % 8)
+    if value != 0:
+        data.append(value)
+    return HttpResponse(bytes(data), content_type='application/octet-stream')
+
+
+obj_id_bitmask = login_required()(_obj_id_bitmask)
 
 
 @login_required()
